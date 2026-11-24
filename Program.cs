@@ -2,14 +2,17 @@
 using FFMpegCore.Pipes;
 using Microsoft.CodeAnalysis.CSharp.Scripting;
 using Microsoft.CodeAnalysis.Scripting;
+using Microsoft.Diagnostics.Runtime;
 using Microsoft.Win32;
 using Microsoft.Windows.AppNotifications;
 using Microsoft.Windows.AppNotifications.Builder;
 using NetCoreAudio;
 using SixLabors.ImageSharp.PixelFormats;
+using SixLabors.ImageSharp.Processing;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.Diagnostics.Metrics;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.Media;
 using System.Net;
@@ -20,13 +23,117 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Text;
-using SixLabors.ImageSharp.Processing;
+using System.Xml.Linq;
+using Windows.ApplicationModel.Background;
+using Windows.UI.WebUI;
+using Path = System.IO.Path;
 #pragma warning disable SYSLIB0014
 
 namespace MyLanguage
 {
     internal class Program
     {
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+        struct MODULEENTRY32
+        {
+            public uint dwsize;
+            public uint th32moduleid;
+            public uint th32procid;
+            public uint glblcntusage;
+            public uint proccntusage;
+            public nint modbaseadr;
+            public uint modbasesize;
+            public nint hmodule;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string szmodule;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string szexepath;
+        }
+        [DllImport("kernel32.dll")]
+        static extern nint CreateToolhelp32Snapshot(uint dwflags, uint th32ProcessID);
+        [DllImport("kernel32.dll")]
+        static extern bool Module32First(nint hsnap, ref MODULEENTRY32 lpme);
+        [DllImport("kernel32.dll")]
+        static extern bool Module32Next(nint hsnap, ref MODULEENTRY32 lpme);
+        [DllImport("kernel32.dll")]
+        static extern nint GetModuleHandle(string lpmodulename);
+        [DllImport("kernel32.dll")]
+        static extern nint GetProcAddress(nint hmodule, string lpprocname);
+        [DllImport("kernel32.dll")]
+        static extern nint CreateRemoteThread(nint hproc, nint lpthreadattrs, uint dwstacksizem, nint lpstartaddress, nint lpparam, uint dwcreationflags, out int lpthreadid);
+        [DllImport("kernel32.dll")]
+        static extern uint WaitForSingleObject(nint hhandle, uint dwmilliseconds);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern nint openscmanager(string? m, string? d, uint a);
+        [DllImport("advapi32.dll,", CharSet = CharSet.Unicode)]
+        static extern nint createsvc(nint scm, string n, string dn, uint a, uint t, uint st, uint ec, string path, string? g, nint tag, string? dep, string? u, string? p);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern nint opensvc(nint scm, string n, uint a);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern bool startsvc(nint s, uint c, nint v);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern bool controlsvc(nint s, uint c, out nint st);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern bool deletesvc(nint s);
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+        static extern bool closesvchandle(nint h);
+        private delegate bool enumwindowsproc(IntPtr hwnd, IntPtr lparam);
+
+        [DllImport("user32.dll", EntryPoint = "EnumWindows")]
+        private static extern bool enumwindows(enumwindowsproc lpenumfunc, IntPtr lparam);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")]
+        private static extern uint getwindowthreadprocessid(IntPtr hwnd, out uint lppwndprocessid);
+
+        [DllImport("user32.dll", EntryPoint = "IsWindowVisible")]
+        private static extern bool iswindowvisible(IntPtr hwnd);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowRect", SetLastError = true)]
+        private static extern bool getwindowrect(IntPtr hwnd, out rect lprect);
+
+        [DllImport("user32.dll", EntryPoint = "PrintWindow", SetLastError = true)]
+        private static extern bool printwindow(IntPtr hwnd, IntPtr hdcblt, uint nflags);
+
+        private const uint pwrectonly = 0x00000000;
+        private const uint pwrenderfullcontent = 0x00000002;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct rect
+        {
+            public int left;
+            public int top;
+            public int right;
+            public int bottom;
+        }
+
+        [DllImport("dbghelp.dll", SetLastError = true, CallingConvention = CallingConvention.StdCall, CharSet = CharSet.Unicode)]
+        public static extern bool MiniDumpWriteDump(
+        IntPtr hProcess,
+        uint ProcessId,
+        SafeHandle hFile,
+        uint DumpType,
+        IntPtr ExceptionParam,
+        IntPtr UserStreamParam,
+        IntPtr CallbackParam);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, uint processId);
+        public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        public const uint PROCESS_VM_READ = 0x0010;
+        [DllImport("dbgeng.dll", EntryPoint = "DebugCreate", CharSet = CharSet.Ansi, CallingConvention = CallingConvention.StdCall)]
+        public static extern int DebugCreate([In] ref Guid InterfaceId, [Out, MarshalAs(UnmanagedType.IUnknown)] out object Interface);
+        [DllImport("ntdll.dll", SetLastError = true)]
+        static extern int NtQueryInformationProcess(IntPtr processHandle, int processInformationClass, ref PROCESS_BASIC_INFORMATION processInformation, int processInformationLength, out int returnLength);
+        [StructLayout(LayoutKind.Sequential)]
+        struct PROCESS_BASIC_INFORMATION
+        {
+            public IntPtr ExitStatus;
+            public IntPtr PebBaseAddress;
+            public IntPtr AffinityMask;
+            public IntPtr BasePriority;
+            public IntPtr UniqueProcessId;
+            public IntPtr InheritedFromUniqueProcessId;
+        }
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
@@ -40,6 +147,14 @@ namespace MyLanguage
 
         [DllImport("kernel32.dll")]
         static extern IntPtr GetConsoleWindow();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool ReadProcessMemory(
+            IntPtr hProcess,
+            IntPtr lpBaseAddress,
+            [Out] byte[] lpBuffer,
+            int dwSize,
+            out IntPtr lpNumberOfBytesRead);
 
         [DllImport("dwmapi.dll")]
         static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
@@ -60,12 +175,6 @@ namespace MyLanguage
         private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out IntPtr lpNumberOfBytesWritten);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string lpModuleName);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);
 
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -78,6 +187,9 @@ namespace MyLanguage
 
         [DllImport("wtsapi32.dll", SetLastError = true)]
         static extern bool WTSQueryUserToken(uint sessionId, out IntPtr phToken);
+
+        [DllImport("ntdll.dll", SetLastError = false)]
+        public static extern IntPtr NtSuspendProcess(IntPtr ProcessHandle);
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         struct STARTUPINFO
@@ -130,6 +242,39 @@ namespace MyLanguage
 
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmStartSession(out uint pSessionHandle, uint dwSessionFlags, string strSessionKey);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmEndSession(uint dwSessionHandle);
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        private static extern int RmRegisterResources(uint dwSessionHandle, uint nFiles, string[] rgsFilenames, uint nApplications, uint[] rgApplications, uint nServices, string[] rgsServiceNames);
+
+        [DllImport("rstrtmgr.dll")]
+        private static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+        [DllImport("kernel32.dll")] static extern bool WriteProcessMemory(IntPtr h, IntPtr adr, byte[] buf, int sz, int w);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RM_UNIQUE_PROCESS
+        {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern int MessageBoxW(IntPtr hWnd, string lpText, string lpCaption, uint uType);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct RM_PROCESS_INFO
+        {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string strServiceShortName;
+            public int ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)] public bool bRestartable;
+        }
         [StructLayout(LayoutKind.Sequential)]
         private struct TOKEN_PRIVILEGES
         {
@@ -142,11 +287,52 @@ namespace MyLanguage
         private const uint SE_PRIVILEGE_ENABLED = 0x00000002;
         private const string SE_DEBUG_NAME = "SeDebugPrivilege";
         const uint THREAD_TERMINATE = 0x0001;
+        [DllImport("ntdll.dll", SetLastError = true)]
+        public static extern IntPtr NtResumeProcess(IntPtr ProcessHandle);
         public static FileSystemWatcher watcher;
         private static BlockingCollection<string> logQueue = [];
         public static string aliasname;
         public static string aliasvalue;
-        public static bool IsDebugModeEnabled;
+        public static bool IsDebugModeEnabled = true;
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("27fe30c2-3bfc-42b7-9a07-3b0c29107496")]
+        public interface IDebugClient
+        {
+            [PreserveSig] int AttachKernel(uint ConnectOptions, string RemoteOptions);
+            [PreserveSig] int OpenDumpFile(string DumpFile, ulong FileHandle);
+            [PreserveSig] int EndSession(uint Flags);
+        }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("51829e2a-87cf-421b-a4e1-300afd17e2f4")]
+        public interface IDebugControl
+        {
+            [PreserveSig] int GetInterrupt();
+            [PreserveSig] int SetInterrupt(uint Flags);
+            [PreserveSig] int WaitForEvent(uint Flags, uint Timeout);
+            [PreserveSig] int GetStackTrace(ulong FrameOffset, ulong StackOffset, ulong InstructionOffset, [Out, MarshalAs(UnmanagedType.LPArray)] DEBUG_STACK_FRAME[] Frames, int FramesSize, out uint FramesFilled);
+            [PreserveSig] int ReadBugCheckData(out uint BugCheckCode, out ulong Param1, out ulong Param2, out ulong Param3, out ulong Param4);
+        }
+
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("8c31e98c-ec28-4666-87e7-7b159f79794e")]
+        public interface IDebugSymbols
+        {
+            [PreserveSig] int GetSymbolPath(StringBuilder Buffer, int BufferSize, out uint PathSize);
+            [PreserveSig] int SetSymbolPath(string Path);
+            [PreserveSig] int GetNameByOffset(ulong Offset, StringBuilder NameBuffer, int NameBufferSize, out uint NameSize, out ulong Displacement);
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DEBUG_STACK_FRAME
+        {
+            public ulong InstructionOffset;
+            public ulong ReturnOffset;
+            public ulong FrameOffset;
+            public ulong StackOffset;
+            public ulong FuncTableEntry;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public ulong[] Params;
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 4)] public ulong[] Reserved;
+            public uint Virtual;
+            public uint FrameNumber;
+        }
         [STAThread]
         static async Task Main(string[] args)
         {
@@ -271,12 +457,32 @@ namespace MyLanguage
             {
                 if (!DisableWarnings) Console.WriteLine("WARNING: Debug Mode can cause errors because of testing. It's recommended to turn it off. \nIf you have enabled this and your computer has been damaged in any way, \nthe developer is not liable for any consequences.");
             }
+            bool isrunningfile = false;
+            string[] filecommands = null;
+            int line = 0;
             if (DisableWelcomeText == false) { Console.WriteLine("Welcome to MyLanguage program!"); }
             while (true)
             {
                 Console.Write($"{Environment.CurrentDirectory}> ");
                 List<string> commands = new List<string>();
                 string userinput = Console.ReadLine();
+
+                if (isrunningfile)
+                {
+                    string file = userinput.Substring(8).Trim();
+                    string nextLine;
+
+                    if (TryGetNextScriptLine(file, ref filecommands, ref line, out nextLine))
+                    {
+                        userinput = nextLine;
+                        Console.WriteLine("[DEBUG] Executing line: " + userinput);
+                        goto start_checks;
+                    }
+                    else
+                    {
+                        isrunningfile = false;
+                    }
+                }
 
             start_checks:
 
@@ -420,179 +626,6 @@ namespace MyLanguage
                     }
                 }
 
-                if (userinput == "help" || userinput == "help 1")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("print [text] - Print text.");
-                    Console.WriteLine("read [filename.extension] - Read file (please do not try this \non executable (.exe) files).");
-                    Console.WriteLine("all files - Show all files in current directory.");
-                    Console.WriteLine("clear - Clear console.");
-                    Console.WriteLine("delete [filename.extension] - Delete file.");
-                    Console.WriteLine("create [filename.extension] - Create file.");
-                    Console.WriteLine("user add [username] - Create a user in your OS.");
-                    Console.WriteLine("user remove [username] - Remove a user in your OS.");
-                    Console.WriteLine("Page 1 -- Type \"help 2\" for next page.");
-                }
-
-                if (userinput == "help 2")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("shutdown pc - Shutdown your OS.");
-                    Console.WriteLine("shutdown pc timer [timer] - Shutdown your OS by the timer (seconds).");
-                    Console.WriteLine("restart pc - Restart your OS.");
-                    Console.WriteLine("restart pc timer [timer] - Restart your OS by the timer (seconds).");
-                    Console.WriteLine("kill process [processname] - Kill a process by it's name.");
-                    Console.WriteLine("open process [processname] - Create a process by it's name.");
-                    Console.WriteLine("task manager - A integrated task manager (no one virus will detect it lol)");
-                    Console.WriteLine("color [foreground or background] [colorname] - Color your console.");
-                    Console.WriteLine("info - Prints info about this app. (try it, it's cool)");
-                    Console.WriteLine("ping [dns.adress or domain] - Pings domain or DNS Server");
-                    Console.WriteLine("Page 2 -- Type \"help 3\" for next page.");
-                }
-
-                if (userinput == "help 3")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("systeminfo (or pcinfo) - Give you information about your PC.");
-                    Console.WriteLine("allow logs - By this you allow logging what commands you type (example: command pcinfo executed).");
-                    Console.WriteLine("deny logs - By this you deny logging what commands you type.");
-                    Console.WriteLine("clear logs - By this you clean logs file.");
-                    Console.WriteLine("redactor - Give you C# (CSharp) redactor, where you can type C# (CSharp) code.");
-                    Console.WriteLine("disable warnings - Disable all program warnings. (not recommended to turn off warnings)");
-                    Console.WriteLine("disable warnings [flag, true or false or y or n] - Disable/Enable all program warnings. \n(not recommended to turn off warnings)");
-                    Console.WriteLine("enable warnings - Enable all warnings.");
-                    Console.WriteLine("enable warnings [flag] - Enable/Disable all program warnings. (not recommended to turn off warnings)");
-                    Console.WriteLine("administrator permission [set/remove] [appname] - Set/Remove administrator rights for/from process.");
-                    Console.WriteLine("currentprocessinfo - Prints all current process info available in Environment method. (apart from process name)");
-                    Console.WriteLine("cmd - Open command prompt.");
-                    Console.WriteLine("powershell - Open powershell.");
-                    Console.WriteLine("Page 3 -- Type \"help 4\" for next page.");
-                }
-
-                if (userinput == "help 4")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("theme [themename] - Allow you to change console theme. \nAll themes:\nmatrix\nrainbow\nverity/veritymatrix");
-                    Console.WriteLine("cd [directoryname] - Direct you to your directory (Directory you type).");
-                    Console.WriteLine("beep [int] [int] - Beep. (Yes, just beep)");
-                    Console.WriteLine("regedit add [path] [regszordwordname] - Add a regedit value in whatever directory.");
-                    Console.WriteLine("regedit remove [path] [whatevertype] - Remove a regedit value in whatever directory.");
-                    Console.WriteLine("regedit edit [path] [regszdwordname] - Edit a regedit value in whatever directory.");
-                    Console.WriteLine("access/grant/icacls [filename] [groupnameorusername] - Give full rights for group/user.");
-                    Console.WriteLine("myip - Show your IP Address.");
-                    Console.WriteLine("network connections - Show all network connections.");
-                    Console.WriteLine("size [int] [int] - Size your console by [int] [int] values.");
-                    Console.WriteLine("writeatfirstline [filename] [text] - Write your text at first line in your requested file.");
-                    Console.WriteLine("writeatlastline [filename] [text] - Write your text at last line in your requested file.");
-                    Console.WriteLine("Page 4 -- Type \"help 5\" for next page.");
-                }
-
-                if (userinput == "help 5")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("hash [filename] - Print your file hash.");
-                    Console.WriteLine("clear garbage - Call C# GC (Garbage Collector) Method and clear all garbage.");
-                    Console.WriteLine("properties [filename] - Show all available information available in C# (CSharp) Environment method.");
-                    Console.WriteLine("service add [name] [path] [displayname] [service_type] [start_type] - Create a service with your arguments.");
-                    Console.WriteLine("C:\\... Open a directory that starts with C:\\.");
-                    Console.WriteLine("D:\\... Open a directory that starts with D:\\.");
-                    Console.WriteLine("calc - Open calculator mode. (Also can be run when you start this program with -calcmode argument).");
-                    Console.WriteLine("where [pidorprocessnamewithoutextension] - Show you the process directory.");
-                    Console.WriteLine("kill process-tree [processname] - Kill original process and its children.");
-                    Console.WriteLine("license - Show program license.");
-                    Console.WriteLine("MoveConsole [int] [int] - Move your console by the coordinates.");
-                    Console.WriteLine("size [int] [int] - Size your console by the coordinates.");
-                    Console.WriteLine("dotnet [arguments] - Run a dotnet task with your arguments.");
-                    Console.WriteLine("Page 5 -- Type \"help 6\" for next page.");
-                }
-
-                if (userinput == "help 6")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("speaker [text] - Speak your text by standard Windows Voice.");
-                    Console.WriteLine("download [url] [filename] - Download your file from requested URL.");
-                    Console.WriteLine("generate random password - Generate random password.");
-                    Console.WriteLine("hex [filename] - Read file by HEX way.");
-                    Console.WriteLine("[name].exe - Start executable file by its name.");
-                    Console.WriteLine("[name].txt - Open text document file with Windows Notepad.");
-                    Console.WriteLine("filecompare text [file1] [file2] - Compares two files by text.");
-                    Console.WriteLine("filecompare bytes [file1] [file2] - Compares one two files by bytes.");
-                    Console.WriteLine("filecompare textandbytes [file1] [file2] - Compares two files by text and bytes.");
-                    Console.WriteLine("game - A C# redactor where you must type a valid text. If:\nYou type empty string - You get a BSOD.\nYou type invalid code - You get a BSOD.\nYou type to close program by any way (If you type game) - You get a BSOD.");
-                    Console.WriteLine("copy [file1] [file2] - Copy file to file.");
-                    Console.WriteLine("rename [file1] [file2] - Renames file name to your file name.");
-                    Console.WriteLine("snake game - Give you a snake game (be careful, if you out of bounds you get a crash)");
-                    Console.WriteLine("runassystem [filepath] - Run a process without window as NT AUTHORITY\\SYSTEM user. (SYSTEM user has more priviliges than Administrator if you don't know, \nand you cannot log in to it.");
-                    Console.WriteLine("tasks - Give you a task menu.");
-                    Console.WriteLine("findstr [string] [file] - Find's a string in a file.");
-                    Console.WriteLine("Page 6 -- Type \"help 7\" for next page.");
-                }
-
-                if (userinput == "help 7")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("close after [timer] - Close program after typed seconds.");
-                    Console.WriteLine("all drivers - Print all drives.");
-                    Console.WriteLine("attribute/attr [attributes] [file] - Gives your attributes to your files.");
-                    Console.WriteLine("service remove [servicename] - Removes serivce by its name.");
-                    Console.WriteLine("service stop [servicename] - Stop service by its name.");
-                    Console.WriteLine("service delete [servicename] - Delete service by its name.");
-                    Console.WriteLine("cleartemp/cleantempfolder/tempdel - \"Clean %systemroot%\\Temp\" folder and \"%TEMP%\" folder also.");
-                    Console.WriteLine("send [ip] [port] [text] - This will connect to device with your IP Address and your port and convert text into bytes, and send it to your device.");
-                    Console.WriteLine("compile [name.cs] [namewithoutexeextension] - Compiles .exe file with using DOTNET and program file.");
-                    Console.WriteLine("dllinject [processname] [dlllibrary] - Injects dll file to exe file.");
-                    Console.WriteLine("battoexe [batfile.bat] [exefile] - Converts bat file to exe file.");
-                    Console.WriteLine("forcekill [processname] - Force kills process by two different ways. (Can be selected after typing this command)");
-                    Console.WriteLine("videototext [file.mp4] - Converts mp4 file to text and plays it in console.");
-                    Console.WriteLine("Page 7 -- Type \"help 8\" for next page.");
-                }
-
-                if (userinput == "help 8")
-                {
-                    commands.Add(userinput);
-                    if (AllowLogs)
-                    {
-                        File.AppendAllText("logs.txt", "Command help executed\n");
-                    }
-                    Console.WriteLine("Commands:");
-                    Console.WriteLine("alias [aliasname] [commandname] - Make an alias for any command.");
-                }
-
                 if (userinput.StartsWith("help"))
                 {
                     commands.Add(userinput);
@@ -653,7 +686,7 @@ namespace MyLanguage
         "writeatlastline [filename] [text] - Write your text at last line in your requested file.",
 
         // --- Page 5 ---
-        "hash [filename] - Print your file hash.",
+        "hash [filename] - Types your file hash.",
         "clear garbage - Call C# GC (Garbage Collector) Method and clear all garbage.",
         "properties [filename] - Show all available information available in C# (CSharp) Environment method.",
         "service add [name] [path] [displayname] [service_type] [start_type] - Create a service with your arguments.",
@@ -681,7 +714,7 @@ namespace MyLanguage
         "copy [file1] [file2] - Copy file to file.",
         "rename [file1] [file2] - Renames file name to your file name.",
         "snake game - Give you a snake game (be careful, if you out of bounds you get a crash)",
-        "runassystem [filepath] - Run a process without window as NT AUTHORITY\\SYSTEM user. (SYSTEM user has more privileges than Administrator if you don't know, and you cannot log in to it.",
+        "runassystem [filepath] - Run a process without window as NT AUTHORITY\\SYSTEM user. (SYSTEM user has more privileges than Administrator if you don't know, and you cannot log in to it.)",
         "tasks - Give you a task menu.",
         "findstr [string] [file] - Find's a string in a file.",
 
@@ -701,7 +734,30 @@ namespace MyLanguage
         "videototext [file.mp4] - Converts mp4 file to text and plays it in console.",
 
         // --- Page 8 ---
-        "alias [aliasname] [commandname] - Make an alias for any command."
+        "alias [aliasname] [commandname] - Make an alias for any command.",
+        "threadkill [processname.exe] - Kills process thread.",
+        "threadsuspend [pid] - Suspends process thread.",
+        "removecritical [process] - Removes critical status from process. Critical status means following program if it will crash or something it will crash Windows.",
+        "processsuspend [processname.exe] - Suspends process.",
+        "processresume [processname.exe] - Resumes process.",
+        "whouses [pathtofile] - Show you which processes are using file.",
+        "execute [filename.mylangscript] - Executes your script. (I lost 6 hours for this stupid command with many debugging)",
+        "readprocessmemory [pid] [0xmemadr] [dwSize] - Read process memory ",
+        "writeprocessmemory [procname] [h] [adr] [bytes] - Write process memory.",
+        "pebinfo [procname] - Show you PEB info about process.",
+        "memory [procname] - Show you how many bytes process allocate for itself.",
+        "msgbox [errortype] [title] | [text] - Show MessageBox window with arguments.",
+        "converttoansi [stringorfile] - Converts string or file to ANSI.",
+        
+        // --- Page 9 ---
+        "createdump [pid] [directory] - Creates dump (.dmp) file about process to your directory.",
+        "dumpread [directory] - Reads dump (.dmp) file.",
+        "firewall add [ip] [address] - Adds a string in hosts file to redirect to your IP in your site.",
+        "firewall delete [ip] [address] - Removes a string in hosts file to redirect to your IP in your site.",
+        "driverload [path] - Loads driver in Windows session.",
+        "driverunload [path] - Unloads driver from Windows session.",
+        "dllunject [pid] [dllname] - Unjects dll from process.",
+        "That's all for this moment. Coming soon for new features!"
     };
 
                     int pageSize = 10;
@@ -723,7 +779,7 @@ namespace MyLanguage
                         int endIndex = Math.Min(startIndex + pageSize, allCommands.Length);
                         for (int i = startIndex; i < endIndex; i++)
                         {
-                            Console.WriteLine(" • " + allCommands[i]);
+                            Console.WriteLine(allCommands[i]);
                         }
                         Console.WriteLine($"\n--- Page {currentPage} of {totalPages} ---");
                         ConsoleKeyInfo keyInfo = Console.ReadKey(true);
@@ -1084,7 +1140,7 @@ namespace MyLanguage
          |___/                   |___/              |__/             
 
 Info:
-Developer: Zilyak Stepan (Stepan 360)
+Developer: Weras1322
 Version: I am not counting versions
 Mail: I want to be privacy
 Thanks for using/watching!
@@ -2348,13 +2404,6 @@ Thanks for using/watching!
                     MoveConsole(int.Parse(numbers[0]), int.Parse(numbers[1]));
                 }
 
-                if (userinput == "readme")
-                {
-                    commands.Add(userinput);
-                    Console.WriteLine("MyLanguage");
-                    Console.WriteLine("This project was made for fun. So if you type incorrect arguments the program just crash. So please don't type whatever such as \"cmd meowwowoow\", I beg you.");
-                }
-
                 if (userinput == "license")
                 {
                     commands.Add(userinput);
@@ -2455,7 +2504,12 @@ Thanks for using/watching!
                 if (userinput.StartsWith("C:\\", StringComparison.OrdinalIgnoreCase) || userinput.StartsWith("D:\\", StringComparison.OrdinalIgnoreCase))
                 {
                     commands.Add(userinput);
-                    Directory.SetCurrentDirectory(userinput);
+                    try {
+                        Directory.SetCurrentDirectory(userinput);
+                    } catch
+                    {
+
+                    }
                 }
 
                 if (userinput.StartsWith("process kill-tree "))
@@ -2865,8 +2919,8 @@ Thanks for using/watching!
                         """);
                     int length = 0;
                     bool isexited = false;
-                    List<string> tasks = new List<string>();
-                    List<string> timertasks = new List<string>();
+                    List<string> tasks = new();
+                    List<string> timertasks = new();
                     while (!isexited)
                     {
                         Console.Write("What you're would like to made?: ");
@@ -3431,25 +3485,561 @@ Thanks for using/watching!
 
                 if (userinput.StartsWith("threadsuspend "))
                 {
+                    var pThread = b(userinput.Substring(14));
+                    SuspendThread(pThread);
+                }
+
+                if (userinput.StartsWith("removecritical "))
+                {
+                    Console.WriteLine("Please use PID instead of process name.");
+                    bool pobf = RemoveCriticalStatus(int.Parse(userinput.Substring(15).Trim()));
+                    if (pobf)
                     {
-                        var pThread = b(userinput.Substring(14));
-                        SuspendThread(pThread);
+                        Console.WriteLine("Successfully changed ProcessBreakOnTermination to 0. \nThat's means process will not crash Windows anymore.");
                     }
 
-                    if (userinput.StartsWith("removecritical "))
+                }
+
+                if (userinput.StartsWith("processsuspend "))
+                {
+                    int pid = Convert.ToInt32(userinput.Substring(15));
+                    const uint PROCESS_SUSPEND_RESUME = 0x0800;
+                    IntPtr processHandle = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+                    if (processHandle != IntPtr.Zero)
                     {
-                        Console.WriteLine("Please use PID instead of process name.");
-                        bool pobf = RemoveCriticalStatus(int.Parse(userinput.Substring(15).Trim()));
-                        if (pobf)
+                        NtSuspendProcess(processHandle);
+                        CloseHandle(processHandle);
+                    }
+                }
+
+                if (userinput.StartsWith("processresume "))
+                {
+                    int pid = Convert.ToInt32(userinput.Substring(14));
+                    const uint PROCESS_SUSPEND_RESUME = 0x0800;
+                    IntPtr processHandle = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+                    if (processHandle != IntPtr.Zero)
+                    {
+                        NtResumeProcess(processHandle);
+                        CloseHandle(processHandle);
+                        // macos is shit
+                    }
+                }
+
+                if (userinput.StartsWith("whouses "))
+                {
+                    string filePath = userinput.Substring(8).Trim().Trim('"');
+
+                    if (!File.Exists(filePath))
+                    {
+                        Console.WriteLine("Error: File does not exist.");
+                        continue;
+                    }
+
+                    var pids = GetProcessesUsingFile(filePath);
+
+                    if (pids.Count == 0)
+                    {
+                        Console.WriteLine("File is not used by any process.");
+                    }
+                    else
+                    {
+                        foreach (int pid in pids)
                         {
-                            Console.WriteLine("Successfully changed ProcessBreakOnTermination to 0. \nThat's means process will not crash Windows anymore.");
+                            string procName = "Unknown";
+                            try { procName = Process.GetProcessById(pid).ProcessName; } catch { }
+                            Console.WriteLine($"[{Path.GetFileName(filePath)}] used by: [{procName} (PID: {pid})]");
+                        }
+                    }
+                }
+
+                if (userinput.StartsWith("execute "))
+                {
+                    Console.WriteLine("Command executed.");
+                    string file = userinput.Substring(8);
+                    if (!File.Exists(file))
+                    {
+                        Console.WriteLine("File not found. Make sure the file placed in the same folder with the program.");
+                    }
+                    else if (!file.EndsWith(".mylangscript"))
+                    {
+                        Console.WriteLine("invalid file type.");
+                    }
+                    else
+                    {
+                        filecommands = File.ReadAllLines(file);
+                        line = 0;
+                        isrunningfile = true;
+
+                        if (line < filecommands.Length)
+                        {
+                            userinput = filecommands[line];
+                            Console.WriteLine("[DEBUG]: Executing line: " + userinput);
+                            line++;
+                            goto start_checks;
+                        }
+                        else
+                        {
+                            isrunningfile = false;
+                        }
+                    }
+                }
+
+                if (userinput.StartsWith("msgbox "))
+                {
+                    string parts = userinput.Substring(7).Trim();
+                    string typePart = parts.Split(' ')[0];
+                    string remaining = parts.Substring(typePart.Length).Trim();
+                    string[] textParts = remaining.Split('|');
+
+                    if (textParts.Length < 2)
+                    {
+                        Console.WriteLine("Error: Invalid syntax");
+                    }
+                    else
+                    {
+                        string caption = textParts[0].Trim();
+                        string text = textParts[1].Trim();
+                        uint uType = 0x00000000;
+                        if (typePart == "1") uType = 0x00000010;
+                        if (typePart == "2") uType = 0x00000040;
+                        if (typePart == "3") uType = 0x00000030;
+                        MessageBoxW(IntPtr.Zero, text, caption, uType);
+                    }
+                }
+
+                if (userinput.StartsWith("readprocessmemory "))
+                {
+                    string[] parts = userinput.Substring(18).Split(' ');
+
+                    if (parts.Length < 2)
+                    {
+                        Console.WriteLine("Invalid syntax. Use: readprocessmemory [PID] [HexAddress] [dwSizeBytes]");
+                    }
+                    else
+                    {
+                        try
+                        {
+                            int pid = Convert.ToInt32(parts[0]);
+                            string hexAddr = parts[1].Replace("0x", "");
+                            IntPtr lpBaseAddress = (IntPtr)Convert.ToInt64(hexAddr, 16);
+                            int dwSize = 64;
+                            if (parts.Length >= 3) dwSize = int.Parse(parts[2]);
+                            byte[] lpBuffer = new byte[dwSize];
+                            IntPtr lpNumberOfBytesRead;
+                            IntPtr hProcess = OpenProcess(0x001F0FFF, false, pid);
+
+                            if (hProcess != IntPtr.Zero)
+                            {
+                                if ((ReadProcessMemory(hProcess, lpBaseAddress, lpBuffer, dwSize, out lpNumberOfBytesRead)))
+                                {
+                                    Console.WriteLine($"Read {lpNumberOfBytesRead} bytes from PID {pid}");
+                                    string hexresult = BitConverter.ToString(lpBuffer).Replace("-", " ");
+                                    Console.WriteLine("HEX Data: " + hexresult);
+                                    string textresult = Encoding.UTF8.GetString(lpBuffer).Trim('\0');
+                                    Console.WriteLine("ASCII Text: " + textresult);
+                                }
+                                else
+                                {
+                                    Console.WriteLine("Failed to read memory. Error code: " + Marshal.GetLastWin32Error());
+                                }
+
+                                CloseHandle(hProcess);
+                            }
+                            else
+                            {
+                                Console.WriteLine("Could not open process.");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Invalid arguments format. " + ex.Message);
+                        }
+                    }
+                }
+
+                if (userinput.StartsWith("getpid ")) {
+                    try
+                    {
+                        string procname = userinput.Substring(7);
+                        if (procname.Contains(".exe")) procname.Replace(".exe", "");
+                        Process[] processes = Process.GetProcessesByName(procname);
+                        foreach (Process PID in processes) {
+                            Console.WriteLine("Process PID: " + PID.Id);
                         }
 
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine("An error occured. Error message: " + e.Message);
+                    }
+                }
+
+                if (userinput.StartsWith("converttoansi "))
+                {
+                    Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+                    if (File.Exists(userinput.Substring(14)))
+                    {
+                        Encoding regional = Encoding.Default;
+                        File.WriteAllText(userinput.Substring(14), File.ReadAllText(userinput.Substring(14)), regional);
+                    } else
+                    {
+                        Encoding regional = Encoding.Default;
+                        Encoding ascii = Encoding.ASCII;
+                        byte[] regionalbytes = regional.GetBytes(userinput.Substring(14));
+                        byte[] asciibytes = Encoding.Convert(regional, ascii, regionalbytes);
+                        string ASCIIString = ascii.GetString(asciibytes);
+                        Console.WriteLine(ASCIIString);
+                    }
+                }
+
+                if (userinput.StartsWith("writeprocessmemory "))
+                {
+                    string[] parts = userinput.Substring(19).Split(' ');
+                    var p = Process.GetProcessesByName(parts[0])[0];
+                    IntPtr h = OpenProcess(0x0020 | 0x0010, false, p.Id);
+                    IntPtr adr = (IntPtr)Convert.ToInt64(parts[1], 16);
+                    byte[] buf = BitConverter.GetBytes(int.Parse(parts[2]));
+                    WriteProcessMemory(h, adr, buf, buf.Length, 0);
+                    Console.WriteLine("Done.");
+                }
+
+                if (userinput.StartsWith("pebinfo "))
+                {
+                    var proc = Process.GetProcessesByName(userinput.Substring(8))[0];
+                    IntPtr hProc = OpenProcess(0x0400 | 0x0010, false, proc.Id);
+                    var pbi = new PROCESS_BASIC_INFORMATION();
+                    int status = NtQueryInformationProcess(hProc, 0, ref pbi, Marshal.SizeOf(pbi), out _);
+                    if (status == 0)
+                    {
+                        byte[] pebBuffer = new byte[56];
+                        if (ReadProcessMemory(hProc, pbi.PebBaseAddress, pebBuffer, pebBuffer.Length, out _))
+                        {
+                            for (int i = 0; i <= pebBuffer.Length - 8; i += 8)
+                            {
+                                long value = BitConverter.ToInt64(pebBuffer, i);
+                                Console.WriteLine($"Offset +{i:D2} (0x{i:X2}): {value} (Hex: 0x{value:X16})");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Error: {status:X}");
+                    }
+                }
+
+                if (userinput.StartsWith("dumpread ")) {
+                    string symbolpath = "srv*C:\\Symbols*https://msdl.microsoft.com/download/symbols";
+                    string path = userinput.Substring(9);
+                    Guid clientGuid = new Guid("27fe30c2-3bfc-42b7-9a07-3b0c29107496");
+                    int hr = DebugCreate(ref clientGuid, out object clientObj);
+                    if (hr != 0 || clientObj == null)
+                    {
+                        Console.WriteLine($"Failed to initializate WinDbg! HRESULT: 0x{hr:X}");
+                        Console.Write("Do you want to download Microsoft.WinDbg?: ");
+                        var answer = Console.ReadLine();
+                        if (answer.Equals("yes", StringComparison.OrdinalIgnoreCase) || answer.Equals("true", StringComparison.OrdinalIgnoreCase)) { Process.Start(new ProcessStartInfo { FileName = "powershell", Arguments = "winget install Microsoft.WinDbg" }); }
+                        else
+                        {
+                            break;
+                        }
+                    }
+                    IDebugClient client = (IDebugClient)clientObj;
+                    IDebugControl control = (IDebugControl)clientObj;
+                    IDebugSymbols symbols = (IDebugSymbols)clientObj;
+                    int openHr = client.OpenDumpFile(path, 0);
+                    symbols.SetSymbolPath(symbolpath);
+                    control.WaitForEvent(0, uint.MaxValue);
+                    control.ReadBugCheckData(out uint bugcheckCode, out ulong p1, out ulong p2, out ulong p3, out ulong p4);
+
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"error code: 0x{bugcheckCode:X8}");
+                    Console.ResetColor();
+                    Console.WriteLine($"value 1: 0x{p1:X16}");
+                    Console.WriteLine($"value 2: 0x{p2:X16}");
+                    DEBUG_STACK_FRAME[] frames = new DEBUG_STACK_FRAME[50];
+                    hr = control.GetStackTrace(0, 0, 0, frames, frames.Length, out uint framesFilled);
+                    if (hr == 0)
+                    {
+                        for (int i = 0; i < framesFilled; i++)
+                        {
+                            ulong offset = frames[i].InstructionOffset;
+                            StringBuilder nameBuffer = new StringBuilder(256);
+                            if (symbols.GetNameByOffset(offset, nameBuffer, nameBuffer.Capacity, out _, out ulong displacement) == 0)
+                            {
+                                Console.WriteLine($"at {nameBuffer} + 0x{displacement:X}");
+                            }
+                        }
+                    }
+                    client.EndSession(1);
+                }
+
+                if (userinput.StartsWith("createdump "))
+                {
+                    string[] parts = userinput.Substring(11).Split(' ');
+                    using (FileStream file = new(string.Join(" ", parts[1..]), FileMode.Create, FileAccess.Write, FileShare.None)) {
+                        IntPtr hProcess = OpenProcess(
+                            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                            false,
+                            uint.Parse(parts[0])
+                        );
+                        bool success = MiniDumpWriteDump(hProcess, uint.Parse(parts[0]), file.SafeFileHandle, 2, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                        if (success)
+                        {
+                            Console.WriteLine($"Dump successfully writed to \"{parts[1]}\" directory.");
+                        } else
+                        {
+                            Console.WriteLine($"You're not so lucky. Error: {Marshal.GetLastWin32Error()}. Good luck in next time!");
+                        }
+                    }
+                }
+
+                if (userinput.StartsWith("memory "))
+                {
+                    Console.WriteLine($"Process memory: {(long)Process.GetProcessesByName(userinput.Substring(7)).Sum(p => p.WorkingSet64) / 1024}");
+                }
+
+                if (userinput.StartsWith("firewall add ")) {
+                    string[] parts = userinput.Substring(13).Split(' ');
+                    File.AppendAllText($"{Environment.GetEnvironmentVariable("SystemRoot")}\\system32\\drivers\\etc\\hosts", $"\n{parts[0]} {parts[1]}");
+                    Console.WriteLine($"Done. IP: {parts[0]}, Address: {parts[1]}");
+                }
+
+                if (userinput.StartsWith("firewall delete "))
+                {
+                    string stringtodelete = userinput.Substring(16);
+                    string[] file = File.ReadAllLines($"{Environment.GetEnvironmentVariable("SystemRoot")}\\system32\\drivers\\etc\\hosts");
+                    List<string> lines = new List<string>();
+                    foreach (var verity in file)
+                    {
+                        if (!verity.Contains(stringtodelete))
+                        {
+                            lines.Add(verity);
+                        }
+                    }
+                    File.WriteAllLines($"{Environment.GetEnvironmentVariable("SystemRoot")}\\system32\\drivers\\etc\\hosts", lines);
+                }
+
+                if (userinput.StartsWith("reg show ")) {
+                    string path = userinput.Substring("reg show ".Length);
+                    RegistryKey root = Registry.LocalMachine;
+                    if (path.StartsWith("HKEY_LOCAL_MACHINE")) { root = Registry.LocalMachine; path = path.Substring("HKEY_LOCAL_MACHINE".Length); }
+                    if (path.StartsWith("HKLM")) { root = Registry.LocalMachine; path = path.Substring("HKLM".Length); }
+                    if (path.StartsWith("HKEY_CURRENT_USER")) { root = Registry.CurrentUser; path = path.Substring("HKEY_CURRENT_USER".Length); }
+                    if (path.StartsWith("HKCU")) { root = Registry.CurrentUser; path = path.Substring("HKCU".Length); }
+                    if (path.StartsWith("HKEY_USERS")) { root = Registry.Users; path = path.Substring("HKEY_USERS".Length); }
+                    if (path.StartsWith("HKU")) { root = Registry.Users; path = path.Substring("HKU".Length); }
+                    if (path.StartsWith("HKEY_CURRENT_CONFIG")) { root = Registry.CurrentConfig; path = path.Substring("HKEY_CURRENT_CONFIG".Length); }
+                    if (path.StartsWith("HKCC")) { root = Registry.CurrentConfig; path = path.Substring("HKCC".Length); }
+                    if (path.StartsWith("\\")) path = path.Substring(1);
+                    if (path.EndsWith("\\"))
+                    {
+                        var key = root.OpenSubKey(path.TrimEnd('\\'));
+                        if (key == null) Console.WriteLine("There is no that path in Registry Editor.");
+                        else {
+                            foreach (var b in key.GetValueNames())
+                            {
+                                Console.WriteLine(b + " " + key.GetValue(b));
+                            }
+                        }
+                    } else
+                    {
+                        int mimimishki = path.LastIndexOf("\\");
+                        string keypath = path.Substring(0, mimimishki);
+                        string keyname = path.Substring(mimimishki + 1);
+                        var by = root.OpenSubKey(keypath);
+                        if (by == null) Console.WriteLine("There is no that key in Registry Editor.");
+                        else {
+                            Console.WriteLine(keyname + " " + by.GetValue(keyname));
+                        }
+                    }
+                }
+
+                if (userinput.StartsWith("windowscreen "))
+                {
+                    string[] parts = userinput.Split(' ');
+                    string pname = parts[1];
+                    string directory = parts[2];
+                    if (pname.EndsWith(".exe")) pname = pname.Substring(0, pname.Length - 4);
+                    Process[] processes = Process.GetProcessesByName(pname);
+                    uint targetpid = (uint)processes[0].Id;
+                    IntPtr hwnd = IntPtr.Zero;
+                    enumwindows((h, lparam) =>
+                    {
+                        uint windowpid;
+                        getwindowthreadprocessid(h, out windowpid);
+                        if (windowpid == targetpid && iswindowvisible(h))
+                        {
+                            hwnd = h;
+                            return false;
+                        }
+                        return true;
+                    }, IntPtr.Zero);
+                    rect windowrect;
+                    getwindowrect(hwnd, out windowrect);
+                    int width = windowrect.right - windowrect.left;
+                    int height = windowrect.bottom - windowrect.top;
+                    Bitmap bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+                    using (Graphics gfx = Graphics.FromImage(bmp))
+                    {
+                        IntPtr hdc = gfx.GetHdc();
+                        try
+                        {
+                            uint flags = pwrectonly | pwrenderfullcontent;
+                            printwindow(hwnd, hdc, flags);
+                        }
+                        finally
+                        {
+                            gfx.ReleaseHdc(hdc);
+                        }
+                    }
+                    bmp.Save(directory + "\\" + pname + ".png", ImageFormat.Png);
+                    Console.WriteLine($"Image saved to: {directory}");
+                }
+
+                if (userinput.StartsWith("loaddriver "))
+                {
+                    string path = Path.GetFullPath(userinput.Substring(11));
+                    string name = Path.GetFileNameWithoutExtension(path);
+                    var scm = openscmanager(null, null, 0xF003F);
+                    var s = createsvc(scm, name, name, 0xF01FF, 1, 3, 1, path, null, 0, null, null, null);
+                    if (s == 0) s = opensvc(scm, name, 0xF01FF);
+                    startsvc(s, 0, 0);
+                    closesvchandle(s);
+                    closesvchandle(scm);
+                }
+
+                if (userinput.StartsWith("unloaddriver "))
+                {
+                    string path = Path.GetFullPath(userinput.Substring(11));
+                    string name = Path.GetFileNameWithoutExtension(path);
+                    var scm = openscmanager(null, null, 0xF003F);
+                    var s = opensvc(scm, name, 0xF01FF);
+                    controlsvc(s, 1, out _);
+                    deletesvc(s);
+                    closesvchandle(s);
+                    closesvchandle(scm);
+                }
+
+                if (userinput.StartsWith("dllunject "))
+                {
+                    string[] p = userinput.Substring(10).Split(' ', 2);
+                    uint pid = uint.Parse(p[0]); 
+                    string dllname = p[1];
+                    IntPtr snap = CreateToolhelp32Snapshot(0x8, pid);
+                    MODULEENTRY32 me = new MODULEENTRY32 { dwsize = (uint)Marshal.SizeOf<MODULEENTRY32>() };
+                    nint modbase = 0;
+
+                    if (Module32First(snap, ref me))
+                    {
+                        do
+                        {
+                            if (me.szmodule == dllname)
+                            {
+                                modbase = me.modbaseadr;
+                                break;
+                            }
+                        } while (Module32Next(snap, ref me));
+                    }
+                    CloseHandle(snap);
+
+                    IntPtr hproc = OpenProcess(0x1F0FFF, false, pid);
+                    nint freelib = GetProcAddress(GetModuleHandle("kernel32.dll"), "FreeLibrary");
+                    IntPtr hthread = CreateRemoteThread(hproc, 0, 0, freelib, modbase, 0, out _);
+
+                    WaitForSingleObject(hthread, 0xFFFFFFFF);
+                    bool success = CloseHandle(hthread);
+                    if (!success)
+                    {
+                        Console.WriteLine("teeest");
+                    }
+                    CloseHandle(hproc);
+                    Console.WriteLine("Command executed successfully");
+                }
+
+                if (isrunningfile)
+                {
+                    if (line < filecommands.Length)
+                    {
+                        userinput = filecommands[line];
+                        if (IsDebugModeEnabled) Console.WriteLine("[DEBUG] Executing line: " + userinput);
+                        line++;
+                        goto start_checks;
+                    }
+                    else
+                    {
+                        isrunningfile = false;
                     }
                 }
             }
         }
+        static bool TryGetNextScriptLine(string file, ref string[] commands, ref int index, out string nextLine)
+        {
+            nextLine = "";
+            if (!File.Exists(file))
+            {
+                Console.WriteLine("File not found. Make sure the file placed in the same folder with the program.");
+                return false;
+            }
+            if (!file.EndsWith(".mylangscript"))
+            {
+                Console.WriteLine("invalid file type.");
+                return false;
+            }
+            if (commands == null)
+            {
+                Console.WriteLine("Command executed.");
+                commands = File.ReadAllLines(file);
+                index = 0;
+            }
+            if (index < commands.Length)
+            {
+                nextLine = commands[index];
+                index++;
+                return true;
+            }
+            commands = null;
+            index = 0;
+            return false;
+        }
 
+
+        public static List<int> GetProcessesUsingFile(string targetPath)
+        {
+            var pids = new List<int>();
+            uint handle;
+            string sessionKey = Guid.NewGuid().ToString();
+            if (RmStartSession(out handle, 0, sessionKey) != 0) return pids;
+            try
+            {
+                string[] resources = { targetPath };
+                if (RmRegisterResources(handle, (uint)resources.Length, resources, 0, null, 0, null) == 0)
+                {
+                    uint pnProcInfoNeeded = 0;
+                    uint pnProcInfo = 0;
+                    uint lpdwRebootReasons = 0;
+                    int res = RmGetList(handle, out pnProcInfoNeeded, ref pnProcInfo, null, ref lpdwRebootReasons);
+                    if (res == 234)
+                    {
+                        var processInfo = new RM_PROCESS_INFO[pnProcInfoNeeded];
+                        pnProcInfo = pnProcInfoNeeded;
+
+                        if (RmGetList(handle, out pnProcInfoNeeded, ref pnProcInfo, processInfo, ref lpdwRebootReasons) == 0)
+                        {
+                            foreach (var info in processInfo)
+                            {
+                                pids.Add(info.Process.dwProcessId);
+                            }
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                RmEndSession(handle);
+            }
+
+            return pids;
+        }
         public static void MoveConsole(int x, int y)
         {
             try
