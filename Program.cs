@@ -23,9 +23,9 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.ServiceProcess;
 using System.Text;
-using System.Xml.Linq;
-using Windows.ApplicationModel.Background;
-using Windows.UI.WebUI;
+using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.Tracing.Parsers;
+using Microsoft.Diagnostics.Tracing.Session;
 using Path = System.IO.Path;
 #pragma warning disable SYSLIB0014
 
@@ -65,35 +65,35 @@ namespace MyLanguage
         static extern uint WaitForSingleObject(nint hhandle, uint dwmilliseconds);
 
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-        static extern nint openscmanager(string? m, string? d, uint a);
+        static extern nint OpenSCManager(string? m, string? d, uint a);
         [DllImport("advapi32.dll,", CharSet = CharSet.Unicode)]
-        static extern nint createsvc(nint scm, string n, string dn, uint a, uint t, uint st, uint ec, string path, string? g, nint tag, string? dep, string? u, string? p);
+        static extern nint CreateService(nint scm, string n, string dn, uint a, uint t, uint st, uint ec, string path, string? g, nint tag, string? dep, string? u, string? p);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-        static extern nint opensvc(nint scm, string n, uint a);
+        static extern nint OpenService(nint scm, string n, uint a);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-        static extern bool startsvc(nint s, uint c, nint v);
+        static extern bool StartService(nint s, uint c, nint v);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-        static extern bool controlsvc(nint s, uint c, out nint st);
+        static extern bool ControlService(nint s, uint c, out nint st);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-        static extern bool deletesvc(nint s);
+        static extern bool DeleteService(nint s);
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-        static extern bool closesvchandle(nint h);
+        static extern bool CloseServiceHandle(nint h);
         private delegate bool enumwindowsproc(IntPtr hwnd, IntPtr lparam);
 
         [DllImport("user32.dll", EntryPoint = "EnumWindows")]
-        private static extern bool enumwindows(enumwindowsproc lpenumfunc, IntPtr lparam);
+        private static extern bool EnumWindows(enumwindowsproc lpenumfunc, IntPtr lparam);
 
         [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")]
-        private static extern uint getwindowthreadprocessid(IntPtr hwnd, out uint lppwndprocessid);
+        private static extern uint GetWindowThreadProcessID(IntPtr hwnd, out uint lppwndprocessid);
 
         [DllImport("user32.dll", EntryPoint = "IsWindowVisible")]
-        private static extern bool iswindowvisible(IntPtr hwnd);
+        private static extern bool IsWindowVisible(IntPtr hwnd);
 
         [DllImport("user32.dll", EntryPoint = "GetWindowRect", SetLastError = true)]
-        private static extern bool getwindowrect(IntPtr hwnd, out rect lprect);
+        private static extern bool GetWindowRect(IntPtr hwnd, out rect lprect);
 
         [DllImport("user32.dll", EntryPoint = "PrintWindow", SetLastError = true)]
-        private static extern bool printwindow(IntPtr hwnd, IntPtr hdcblt, uint nflags);
+        private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcblt, uint nflags);
 
         private const uint pwrectonly = 0x00000000;
         private const uint pwrenderfullcontent = 0x00000002;
@@ -240,6 +240,16 @@ namespace MyLanguage
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
         private static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out long lpLuid);
 
+        [DllImport("ntdll.dll")]
+        static extern uint NtRaiseHardError(
+            uint ErrorStatus,
+            uint NumberOfParameters,
+            uint UnicodeStringParameterMask,
+            IntPtr Parameters,
+            uint ValidResponseOptions,
+            out uint Response
+        );
+
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
         [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
@@ -333,6 +343,13 @@ namespace MyLanguage
             public uint Virtual;
             public uint FrameNumber;
         }
+        [DllImport("ntdll.dll")]
+        static extern uint RtlAdjustPrivilege(
+            int Privilege,
+            bool bEnablePrivilege,
+            bool IsThreadPrivilege,
+            out bool PreviousValue
+        );
         [STAThread]
         static async Task Main(string[] args)
         {
@@ -341,6 +358,13 @@ namespace MyLanguage
             else
             {
                 Console.WriteLine("Failed to high up process rights. Some features will not available.");
+            }
+            try
+            {
+                RtlAdjustPrivilege(19, true, false, out bool previousValue);
+            } catch (Exception e)
+            {
+                Console.WriteLine($"Error: {e.Message}");
             }
             bool isdirectoryexists = Directory.Exists("C:\\WINNT");
             if (isdirectoryexists)
@@ -757,6 +781,9 @@ namespace MyLanguage
         "driverload [path] - Loads driver in Windows session.",
         "driverunload [path] - Unloads driver from Windows session.",
         "dllunject [pid] [dllname] - Unjects dll from process.",
+        "windowscreen [pname] [directory] - Make a window screenshot and saves to your directory.",
+        "httpwatcher [program - optional] - Watch all network requests or watch network requests by your process.",
+        "processwatcher [program - optional] Watch all things made by all processes or watch all things made by your process.",
         "That's all for this moment. Coming soon for new features!"
     };
 
@@ -1224,7 +1251,7 @@ Thanks for using/watching!
                     {
                         Console.WriteLine(i);
                     }
-                    TimeSpan uptime = TimeSpan.FromMilliseconds(Environment.TickCount);
+                    TimeSpan uptime = TimeSpan.FromMilliseconds(Environment.TickCount64);
                     Console.WriteLine($"Total Processor Time: {process.TotalProcessorTime}");
                     Console.WriteLine($"User Processor Time: {process.UserProcessorTime}");
                     Console.WriteLine($"PC Uptime: {uptime.Days} Days, {uptime.Hours} Hours, {uptime.Minutes} Minutes, {uptime.Seconds} Seconds");
@@ -2753,8 +2780,10 @@ Thanks for using/watching!
                     catch
                     {
                         Console.WriteLine("You made a mistake. Say hello for BSOD");
+                        bsodenjoying();
                     }
                 }
+
                 if (userinput == "all drivers")
                 {
                     commands.Add(userinput);
@@ -3863,11 +3892,11 @@ Thanks for using/watching!
                     Process[] processes = Process.GetProcessesByName(pname);
                     uint targetpid = (uint)processes[0].Id;
                     IntPtr hwnd = IntPtr.Zero;
-                    enumwindows((h, lparam) =>
+                    EnumWindows((h, lparam) =>
                     {
                         uint windowpid;
-                        getwindowthreadprocessid(h, out windowpid);
-                        if (windowpid == targetpid && iswindowvisible(h))
+                        GetWindowThreadProcessID(h, out windowpid);
+                        if (windowpid == targetpid && IsWindowVisible(h))
                         {
                             hwnd = h;
                             return false;
@@ -3875,7 +3904,7 @@ Thanks for using/watching!
                         return true;
                     }, IntPtr.Zero);
                     rect windowrect;
-                    getwindowrect(hwnd, out windowrect);
+                    GetWindowRect(hwnd, out windowrect);
                     int width = windowrect.right - windowrect.left;
                     int height = windowrect.bottom - windowrect.top;
                     Bitmap bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
@@ -3885,7 +3914,7 @@ Thanks for using/watching!
                         try
                         {
                             uint flags = pwrectonly | pwrenderfullcontent;
-                            printwindow(hwnd, hdc, flags);
+                            PrintWindow(hwnd, hdc, flags);
                         }
                         finally
                         {
@@ -3900,30 +3929,30 @@ Thanks for using/watching!
                 {
                     string path = Path.GetFullPath(userinput.Substring(11));
                     string name = Path.GetFileNameWithoutExtension(path);
-                    var scm = openscmanager(null, null, 0xF003F);
-                    var s = createsvc(scm, name, name, 0xF01FF, 1, 3, 1, path, null, 0, null, null, null);
-                    if (s == 0) s = opensvc(scm, name, 0xF01FF);
-                    startsvc(s, 0, 0);
-                    closesvchandle(s);
-                    closesvchandle(scm);
+                    var scm = OpenSCManager(null, null, 0xF003F);
+                    var s = CreateService(scm, name, name, 0xF01FF, 1, 3, 1, path, null, 0, null, null, null);
+                    if (s == 0) s = OpenService(scm, name, 0xF01FF);
+                    StartService(s, 0, 0);
+                    CloseServiceHandle(s);
+                    CloseServiceHandle(scm);
                 }
 
                 if (userinput.StartsWith("unloaddriver "))
                 {
                     string path = Path.GetFullPath(userinput.Substring(11));
                     string name = Path.GetFileNameWithoutExtension(path);
-                    var scm = openscmanager(null, null, 0xF003F);
-                    var s = opensvc(scm, name, 0xF01FF);
-                    controlsvc(s, 1, out _);
-                    deletesvc(s);
-                    closesvchandle(s);
-                    closesvchandle(scm);
+                    var scm = OpenSCManager(null, null, 0xF003F);
+                    var s = OpenService(scm, name, 0xF01FF);
+                    ControlService(s, 1, out _);
+                    DeleteService(s);
+                    CloseServiceHandle(s);
+                    CloseServiceHandle(scm);
                 }
 
                 if (userinput.StartsWith("dllunject "))
                 {
                     string[] p = userinput.Substring(10).Split(' ', 2);
-                    uint pid = uint.Parse(p[0]); 
+                    uint pid = uint.Parse(p[0]);
                     string dllname = p[1];
                     IntPtr snap = CreateToolhelp32Snapshot(0x8, pid);
                     MODULEENTRY32 me = new MODULEENTRY32 { dwsize = (uint)Marshal.SizeOf<MODULEENTRY32>() };
@@ -3947,13 +3976,103 @@ Thanks for using/watching!
                     IntPtr hthread = CreateRemoteThread(hproc, 0, 0, freelib, modbase, 0, out _);
 
                     WaitForSingleObject(hthread, 0xFFFFFFFF);
-                    bool success = CloseHandle(hthread);
-                    if (!success)
-                    {
-                        Console.WriteLine("teeest");
-                    }
+                    CloseHandle(hthread);
                     CloseHandle(hproc);
-                    Console.WriteLine("Command executed successfully");
+                    Console.WriteLine("Command executed");
+                }
+
+                if (userinput.StartsWith("bsod "))
+                {
+                    uint errorstatus = uint.Parse(userinput.Substring(5));
+                    NtRaiseHardError(errorstatus, 0, 0, IntPtr.Zero, 6, out _);
+                }
+
+                if (userinput == "processwatcher" || userinput.StartsWith("processwatcher "))
+                {
+                    string target = userinput.Length > 15 ? userinput.Substring(15).Replace(".exe", "") : null;
+                    HashSet<int> targetpids = new HashSet<int>();
+
+                    if (target != null)
+                        foreach (var p in Process.GetProcessesByName(target)) targetpids.Add(p.Id);
+
+                    using var session = new TraceEventSession("programwatcher");
+                    session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.ImageLoad);
+
+                    session.Source.Kernel.ProcessStart += data =>
+                    {
+                        if (target != null && !data.ProcessName.Equals(target, StringComparison.OrdinalIgnoreCase)) return;
+                        targetpids.Add(data.ProcessID);
+                        Console.WriteLine($"processstart: {data.ProcessName} (PID: {data.ProcessID}) -> {data.CommandLine}");
+                    };
+
+                    session.Source.Kernel.ProcessStop += data =>
+                    {
+                        if (target != null && !targetpids.Contains(data.ProcessID)) return;
+                        targetpids.Remove(data.ProcessID);
+                        Console.WriteLine($"processstop: {data.ProcessName} (PID: {data.ProcessID})");
+                    };
+
+                    session.Source.Kernel.ImageLoad += data =>
+                    {
+                        if (target != null && !targetpids.Contains(data.ProcessID)) return;
+                        Console.WriteLine($"dll: PID {data.ProcessID} -> {data.FileName}");
+                    };
+
+                    Task.Run(() => session.Source.Process());
+                    while (Console.ReadKey(true).Key != ConsoleKey.Escape) { }
+                    session.Dispose();
+                }
+
+                if (userinput == "httpwatcher" || userinput.StartsWith("httpwatcher "))
+                {
+                    string target = userinput.Length > 12 ? userinput.Substring(12).Replace(".exe", "") : null;
+                    HashSet<int> targetpids = new HashSet<int>();
+
+                    if (target != null)
+                        foreach (var p in Process.GetProcessesByName(target)) targetpids.Add(p.Id);
+
+                    using var session = new TraceEventSession("MyLangHttpWatcher");
+                    session.EnableKernelProvider(KernelTraceEventParser.Keywords.Process | KernelTraceEventParser.Keywords.NetworkTCPIP);
+                    session.EnableProvider("Microsoft-Windows-WinINet");
+                    session.EnableProvider("Microsoft-Windows-DNS-Client");
+
+                    session.Source.Kernel.ProcessStart += data =>
+                    {
+                        if (target != null && data.ProcessName.Equals(target, StringComparison.OrdinalIgnoreCase))
+                            targetpids.Add(data.ProcessID);
+                    };
+
+                    session.Source.Kernel.TcpIpConnect += data =>
+                    {
+                        if (target != null && !targetpids.Contains(data.ProcessID)) return;
+                        Console.WriteLine($"tcp: {data.ProcessName} ({data.ProcessID}) -> {data.daddr}:{data.dport}");
+                    };
+
+                    session.Source.Dynamic.All += data =>
+                    {
+                        if (target != null && !targetpids.Contains(data.ProcessID)) return;
+
+                        if (data.ProviderName == "Microsoft-Windows-DNS-Client" && data.EventName.Contains("Query"))
+                        {
+                            var queryName = data.PayloadByName("QueryName")?.ToString();
+                            if (!string.IsNullOrEmpty(queryName))
+                            {
+                                Console.WriteLine($"dns: pid {data.ProcessID} -> {queryName}");
+                            }
+                        }
+                        else if (data.ProviderName == "Microsoft-Windows-WinINet")
+                        {
+                            var url = data.PayloadByName("URL")?.ToString() ?? data.PayloadByName("ServerName")?.ToString();
+                            if (!string.IsNullOrEmpty(url))
+                            {
+                                Console.WriteLine($"http: pid {data.ProcessID} ({data.EventName}) -> {url}");
+                            }
+                        }
+                    };
+
+                    Task.Run(() => session.Source.Process());
+                    while (Console.ReadKey(true).Key != ConsoleKey.Escape) { }
+                    session.Dispose();
                 }
 
                 if (isrunningfile)
